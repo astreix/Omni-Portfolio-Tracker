@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { LayoutGrid, PieChart, ArrowUpRight, ArrowDownLeft, Import, Settings, Briefcase, Filter, LogOut, LogIn, TrendingUp, Calendar, Plus, Save } from 'lucide-react';
+import { LayoutGrid, PieChart, ArrowUpRight, ArrowDownLeft, Import, Settings, Briefcase, Filter, LogOut, LogIn, TrendingUp, Calendar, Plus, Save, Search } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Ticker, Transaction, DividendRecorded, DividendSchedule, Holding, Account } from './types';
 import { calculateHoldings, calculateIncomeForecast } from './lib/portfolioLogic';
@@ -77,6 +77,24 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    const fetchSearchResults = async () => {
+      if (tickerQuery.length < 2) {
+        setTickerResults([]);
+        return;
+      }
+      try {
+        const res = await fetch(`/api/search?q=${encodeURIComponent(tickerQuery)}`);
+        const results = await res.json();
+        setTickerResults(results || []);
+      } catch (e) {
+        console.error(e);
+      }
+    };
+    const timer = setTimeout(fetchSearchResults, 300);
+    return () => clearTimeout(timer);
+  }, [tickerQuery]);
+
   const handleAddAccount = async () => {
     if (!forms.accountName) return;
     const res = await fetch('/api/accounts', {
@@ -100,11 +118,13 @@ export default function App() {
       
       const mapped = result.map((item: any, index: number) => {
         const errors: string[] = [];
-        let ticker = (item['Ticker'] || '').split(',')[0].trim(); // Handle "LON:DEC"
+        let ticker = (item['Ticker'] || '').split(',')[0].trim();
         
         // Smart Ticker Correction (Yahoo formats)
         if (ticker.includes(':')) {
-          const [exchange, sym] = ticker.split(':');
+          const parts = ticker.split(':');
+          const exchange = parts[0].trim();
+          const sym = parts[1].trim();
           if (exchange === 'LON') ticker = `${sym}.L`;
           else if (exchange === 'HKG') ticker = `${sym.padStart(4, '0')}.HK`;
           else if (exchange === 'TSE') ticker = `${sym}.TO`;
@@ -119,7 +139,7 @@ export default function App() {
         if (isNaN(qty)) errors.push(`Invalid Quantity: ${item['Quantity']}`);
         if (isNaN(rawPrice)) errors.push(`Invalid Price: ${item['Purchase Price'] || item['Price']}`);
 
-        // Parse Date (21-Jan-22)
+        // Parse Date (21-Jan-22 or 2022-01-21)
         let dateStr = item['Date'] || '';
         if (dateStr.includes('-')) {
           const parts = dateStr.split('-');
@@ -134,13 +154,17 @@ export default function App() {
         }
         
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-          errors.push(`Invalid Date format: ${item['Date']}. Expected DD-Mon-YY.`);
+          errors.push(`Invalid Date: ${item['Date']}. Use DD-Mon-YY.`);
         }
 
         let priceGbp = rawPrice;
-        if (currency.toLowerCase() === 'gbp') priceGbp = rawPrice;
-        else if (currency.toLowerCase() === 'gbp') priceGbp = rawPrice / 100;
-        else priceGbp = rawPrice / fxRate;
+        if (currency === 'GBP') {
+          priceGbp = rawPrice;
+        } else if (currency === 'GBp') {
+          priceGbp = rawPrice / 100;
+        } else {
+          priceGbp = rawPrice / fxRate;
+        }
 
         const totalGbp = Math.abs(qty) * priceGbp;
 
@@ -192,12 +216,24 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transactions: mappedToApi })
       });
+      
       const summary = await res.json();
+      
+      if (!res.ok) {
+        throw new Error(summary.error || 'Server rejected the batch.');
+      }
+
+      if (summary.errors && summary.errors.length > 0) {
+        alert(`Commit partially failed:\n${summary.errors.slice(0, 3).join('\n')}`);
+      }
+
       setImportStatus(`Imported ${summary.imported} records. ${summary.skipped} duplicates skipped.`);
       setStagedTransactions([]);
       fetchInitialData();
-    } catch (e) {
-      setImportStatus('Error during commit');
+    } catch (e: any) {
+      console.error(e);
+      setImportStatus(`Commit Failed: ${e.message}`);
+      alert(`Error committing records: ${e.message}`);
     }
   };
 
@@ -451,13 +487,28 @@ export default function App() {
                             placeholder="Search Yahoo symbols..."
                             className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-bold text-indigo-400 outline-none focus:ring-1 focus:ring-indigo-500"
                             value={tickerQuery}
-                            onChange={e => {
-                              setTickerQuery(e.target.value);
-                              // Simple debounce logic if needed
-                            }}
+                            onChange={e => setTickerQuery(e.target.value)}
                           />
                        </div>
-                       <p className="text-[10px] text-slate-600 font-bold leading-relaxed">
+                       
+                       <div className="space-y-2 max-h-40 overflow-y-auto custom-scrollbar my-4">
+                          {tickerResults.map((r, idx) => (
+                            <div 
+                              key={idx} 
+                              className="text-[10px] bg-slate-800/50 p-2 rounded flex justify-between items-center cursor-pointer hover:bg-indigo-500/20"
+                              onClick={() => {
+                                // If they click a result, let's copy the symbol
+                                navigator.clipboard.writeText(r.symbol);
+                                alert(`Copied ${r.symbol} to clipboard`);
+                              }}
+                            >
+                              <span className="font-bold text-indigo-400">{r.symbol}</span>
+                              <span className="text-slate-500 truncate ml-2">{r.shortname || r.longname}</span>
+                            </div>
+                          ))}
+                       </div>
+
+                       <p className="text-[10px] text-slate-600 font-bold leading-relaxed border-t border-slate-800 pt-4">
                          US: RELX<br/>
                          London: REL.L<br/>
                          Brazil: PBR, PBR-A<br/>
@@ -494,42 +545,60 @@ export default function App() {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-800/50">
-                            {stagedTransactions.map((st, i) => (
-                              <tr key={i} className="group">
-                                <td className="px-4 py-3">
-                                  <input 
-                                    className="bg-transparent border-none text-[11px] font-black text-white outline-none focus:text-indigo-400 w-20"
-                                    value={st.ticker_symbol}
-                                    onChange={e => {
-                                      const newTxs = [...stagedTransactions];
-                                      newTxs[i].ticker_symbol = e.target.value;
-                                      setStagedTransactions(newTxs);
-                                    }}
-                                  />
-                                </td>
-                                <td className="px-4 py-3">
-                                  <input 
-                                    type="date"
-                                    className="bg-transparent border-none text-[11px] font-bold text-slate-400 outline-none focus:text-white"
-                                    value={st.date}
-                                    onChange={e => {
-                                      const newTxs = [...stagedTransactions];
-                                      newTxs[i].date = e.target.value;
-                                      setStagedTransactions(newTxs);
-                                    }}
-                                  />
-                                </td>
-                                <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{st.quantity}</td>
-                                <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{st.price} {st.currency}</td>
-                                <td className="px-4 py-3">
-                                  {st.errors.length > 0 ? (
-                                    <span className="text-[10px] font-black text-rose-500 uppercase">{st.errors[0]}</span>
-                                  ) : (
-                                    <span className="text-[10px] font-black text-emerald-500 uppercase">VALID</span>
-                                  )}
-                                </td>
-                              </tr>
-                            ))}
+                              {stagedTransactions.map((st, i) => (
+                                <tr key={st.id} className="group">
+                                  <td className="px-4 py-3">
+                                    <div className="flex items-center gap-2">
+                                      <input 
+                                        className="bg-transparent border-none text-[11px] font-black text-white outline-none focus:text-indigo-400 w-24"
+                                        value={st.ticker_symbol}
+                                        onChange={e => {
+                                          const newTxs = [...stagedTransactions];
+                                          newTxs[i].ticker_symbol = e.target.value;
+                                          setStagedTransactions(newTxs);
+                                        }}
+                                      />
+                                      <button 
+                                        onClick={() => setTickerQuery(st.ticker_symbol)}
+                                        className="opacity-0 group-hover:opacity-100 text-slate-600 hover:text-indigo-400 transition-all"
+                                        title="Lookup in reference"
+                                      >
+                                        <Search size={12} />
+                                      </button>
+                                    </div>
+                                  </td>
+                                  <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{st.type}</td>
+                                  <td className="px-4 py-3">
+                                    <input 
+                                      type="date"
+                                      className="bg-transparent border-none text-[11px] font-bold text-slate-400 outline-none focus:text-white"
+                                      value={st.date}
+                                      onChange={e => {
+                                        const newTxs = [...stagedTransactions];
+                                        newTxs[i].date = e.target.value;
+                                        setStagedTransactions(newTxs);
+                                      }}
+                                    />
+                                  </td>
+                                  <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{st.quantity}</td>
+                                  <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{(st.price).toFixed(2)} {st.currency}</td>
+                                  <td className="px-4 py-3 flex items-center justify-between">
+                                    {st.errors.length > 0 ? (
+                                      <span className="text-[10px] font-black text-rose-500 uppercase">{st.errors[0]}</span>
+                                    ) : (
+                                      <span className="text-[10px] font-black text-emerald-500 uppercase">VALID</span>
+                                    )}
+                                    <button 
+                                      onClick={() => {
+                                        setStagedTransactions(prev => prev.filter((_, idx) => idx !== i));
+                                      }}
+                                      className="opacity-0 group-hover:opacity-100 text-slate-600 hover:text-rose-500 transition-all px-2"
+                                    >
+                                      ×
+                                    </button>
+                                  </td>
+                                </tr>
+                              ))}
                           </tbody>
                         </table>
                       </div>
