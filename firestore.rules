@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+       return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+
+    // --- Entity Validations ---
+    
+    function isValidTransaction(data) {
+      return data.keys().hasAll(['userId', 'portfolioId', 'tickerSymbol', 'account', 'type', 'date', 'quantity', 'price', 'totalGbp'])
+        && data.keys().size() <= 13
+        && data.userId == request.auth.uid
+        && data.portfolioId is string && data.portfolioId.size() <= 64
+        && data.tickerSymbol is string && data.tickerSymbol.size() <= 32
+        && data.account is string && data.account.size() <= 64
+        && data.type in ['Buy', 'Sell']
+        && data.date is string && data.date.size() <= 20
+        && data.quantity is number && data.quantity >= 0
+        && data.price is number && data.price >= 0
+        && data.totalGbp is number && data.totalGbp >= 0;
+    }
+
+    function isValidDividend(data) {
+      return data.keys().hasAll(['userId', 'portfolioId', 'tickerSymbol', 'account', 'date', 'amount', 'totalGbp'])
+        && data.keys().size() <= 11
+        && data.userId == request.auth.uid
+        && data.portfolioId is string && data.portfolioId.size() <= 64
+        && data.tickerSymbol is string && data.tickerSymbol.size() <= 32
+        && data.date is string && data.date.size() <= 20
+        && data.amount is number && data.amount >= 0
+        && data.totalGbp is number && data.totalGbp >= 0;
+    }
+
+    function isValidTicker(data) {
+      return data.keys().hasAll(['userId', 'symbol'])
+        && data.keys().size() <= 6
+        && data.userId == request.auth.uid
+        && data.symbol is string && data.symbol.size() <= 32
+        && (!('manualPrice' in data) || data.manualPrice is number);
+    }
+
+    // --- Routes ---
+
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      
+      match /transactions/{txId} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId) && isValidId(txId);
+        allow create: if isOwner(userId) && isValidTransaction(incoming());
+        allow update: if isOwner(userId) && isValidTransaction(incoming()) 
+          && incoming().userId == existing().userId; // Immutable owner
+        allow delete: if isOwner(userId);
+      }
+
+      match /dividends/{divId} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId) && isValidId(divId);
+        allow create: if isOwner(userId) && isValidDividend(incoming());
+        allow update: if isOwner(userId) && isValidDividend(incoming())
+          && incoming().userId == existing().userId;
+        allow delete: if isOwner(userId);
+      }
+
+      match /tickers/{symbol} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId) && isValidId(symbol);
+        allow create: if isOwner(userId) && isValidTicker(incoming());
+        allow update: if isOwner(userId) && isValidTicker(incoming())
+          && incoming().userId == existing().userId;
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

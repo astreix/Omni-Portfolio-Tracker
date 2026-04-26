@@ -1,0 +1,69 @@
+{
+  "entities": {
+    "Transaction": {
+      "title": "Transaction",
+      "description": "A financial transaction (Buy/Sell)",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "portfolioId": { "type": "string" },
+        "tickerSymbol": { "type": "string" },
+        "account": { "type": "string" },
+        "type": { "type": "string", "enum": ["Buy", "Sell"] },
+        "date": { "type": "string", "format": "date" },
+        "quantity": { "type": "number" },
+        "price": { "type": "number" },
+        "currency": { "type": "string" },
+        "fxRate": { "type": "number" },
+        "fees": { "type": "number" },
+        "totalGbp": { "type": "number" }
+      },
+      "required": ["userId", "portfolioId", "tickerSymbol", "account", "type", "date", "quantity", "price", "totalGbp"]
+    },
+    "Dividend": {
+      "title": "Dividend",
+      "description": "Dividend payment record",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "portfolioId": { "type": "string" },
+        "tickerSymbol": { "type": "string" },
+        "account": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "amount": { "type": "number" },
+        "wht": { "type": "number" },
+        "currency": { "type": "string" },
+        "fxRate": { "type": "number" },
+        "totalGbp": { "type": "number" }
+      },
+      "required": ["userId", "portfolioId", "tickerSymbol", "account", "date", "amount", "totalGbp"]
+    },
+    "TickerSettings": {
+      "title": "Ticker Settings",
+      "description": "User-specific settings for a ticker (e.g. manual price)",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "symbol": { "type": "string" },
+        "manualPrice": { "type": "number" },
+        "isManual": { "type": "boolean" },
+        "lastUpdated": { "type": "string" }
+      },
+      "required": ["userId", "symbol"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "User transactions"
+    },
+    "/users/{userId}/dividends/{dividendId}": {
+      "schema": "Dividend",
+      "description": "User dividends"
+    },
+    "/users/{userId}/tickers/{symbol}": {
+      "schema": "TickerSettings",
+      "description": "User ticker overrides"
+    }
+  }
+}
