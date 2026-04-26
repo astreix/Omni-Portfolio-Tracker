@@ -3,6 +3,8 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import Database from "better-sqlite3";
 import yahooFinance from "yahoo-finance2";
+// In newer versions of yahoo-finance2, a new instance must be created if using as a standalone
+const yf = typeof yahooFinance === 'function' ? new (yahooFinance as any)() : yahooFinance;
 import { parse } from "csv-parse/sync";
 
 interface Ticker {
@@ -110,11 +112,31 @@ db.exec(`
   );
 `);
 
+// Migration: Ensure new columns exist in transactions
+try {
+  db.prepare("ALTER TABLE transactions ADD COLUMN account_id INTEGER").run();
+} catch (e) {}
+try {
+  db.prepare("ALTER TABLE transactions ADD COLUMN fx_rate REAL DEFAULT 1").run();
+} catch (e) {}
+try {
+  db.prepare("ALTER TABLE transactions ADD COLUMN fees REAL DEFAULT 0").run();
+} catch (e) {}
+try {
+  db.prepare("ALTER TABLE transactions ADD COLUMN total_gbp REAL").run();
+} catch (e) {}
+try {
+  db.prepare("ALTER TABLE dividends_recorded ADD COLUMN account_id INTEGER").run();
+} catch (e) {}
+try {
+  db.prepare("ALTER TABLE dividends_recorded ADD COLUMN wht_gbp REAL DEFAULT 0").run();
+} catch (e) {}
+
 async function getHistoricalFX(from: string, to: string, date: string) {
   if (from === to) return 1;
   const symbol = `${from}${to}=X`;
   try {
-    const result = await (yahooFinance.historical(symbol, {
+    const result = await (yf.historical(symbol, {
       period1: date,
       period2: new Date(new Date(date).getTime() + 86400000).toISOString().split('T')[0],
     }) as Promise<any[]>);
@@ -152,11 +174,16 @@ async function startServer() {
 
   app.post("/api/transactions", (req, res) => {
     const { ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp } = req.body;
-    db.prepare(`
-      INSERT INTO transactions (ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp);
-    res.json({ success: true });
+    try {
+      db.prepare("INSERT OR IGNORE INTO tickers (symbol, name, asset_class) VALUES (?, ?, ?)").run(ticker_symbol, ticker_symbol, 'Equity');
+      db.prepare(`
+        INSERT INTO transactions (ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   app.get("/api/dividends-recorded", (req, res) => {
@@ -171,6 +198,11 @@ async function startServer() {
       VALUES (?, ?, ?, ?, ?)
     `).run(ticker, account_id, date, amount_gbp, wht_gbp);
     res.json({ success: true });
+  });
+
+  app.get("/api/dividend-schedule", (req, res) => {
+    const schedules = db.prepare("SELECT * FROM dividend_schedule").all();
+    res.json(schedules);
   });
 
   app.post("/api/dividend-schedule", (req, res) => {
@@ -195,7 +227,7 @@ async function startServer() {
     const { q } = req.query;
     if (!q) return res.json([]);
     try {
-      const result = await (yahooFinance.search(q as string) as Promise<any>);
+      const result = await (yf.search(q as string) as Promise<any>);
       res.json(result.quotes || []);
     } catch (e) {
       res.status(500).json({ error: "Search failed" });
@@ -203,6 +235,7 @@ async function startServer() {
   });
 
   app.post("/api/batches/transactions", (req, res) => {
+    console.log("Batch Import Request received:", req.body?.transactions?.length, "records");
     const { transactions } = req.body;
     if (!transactions || !Array.isArray(transactions)) {
       return res.status(400).json({ error: "Invalid payload" });
@@ -210,43 +243,53 @@ async function startServer() {
 
     const results = { imported: 0, skipped: 0, errors: [] as string[] };
     
-    const checkStmt = db.prepare("SELECT id FROM transactions WHERE ticker_symbol = ? AND date = ? AND quantity = ? AND account_id = ?");
-    const insertStmt = db.prepare(`
-      INSERT INTO transactions (ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    try {
+      const tickerStmt = db.prepare("INSERT OR IGNORE INTO tickers (symbol, name, asset_class) VALUES (?, ?, ?)");
+      const checkStmt = db.prepare("SELECT id FROM transactions WHERE ticker_symbol = ? AND date = ? AND quantity = ? AND account_id = ?");
+      const insertStmt = db.prepare(`
+        INSERT INTO transactions (ticker_symbol, account_id, type, date, quantity, price, currency, fx_rate, fees, total_gbp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
 
-    const transaction = db.transaction((txs: any[]) => {
-      for (const t of txs) {
-        try {
-          // Duplicate check: Same ticker, date, qty, and account
-          const exists = checkStmt.get(t.ticker_symbol, t.date, t.quantity, t.account_id);
-          if (exists) {
-            results.skipped++;
-            continue;
+      const transaction = db.transaction((txs: any[]) => {
+        for (const t of txs) {
+          try {
+            // Auto-provision ticker
+            tickerStmt.run(t.ticker_symbol, t.ticker_symbol, 'Equity');
+
+            // Duplicate check: Same ticker, date, qty, and account
+            const exists = checkStmt.get(t.ticker_symbol, t.date, t.quantity, t.account_id);
+            if (exists) {
+              results.skipped++;
+              continue;
+            }
+
+            insertStmt.run(
+              t.ticker_symbol,
+              t.account_id,
+              t.type,
+              t.date,
+              t.quantity,
+              t.price,
+              t.currency,
+              t.fx_rate,
+              t.fees || 0,
+              t.total_gbp
+            );
+            results.imported++;
+          } catch (e: any) {
+            console.error("Row error:", e);
+            results.errors.push(`Error on ${t.ticker_symbol} (${t.date}): ${e.message}`);
           }
-
-          insertStmt.run(
-            t.ticker_symbol,
-            t.account_id,
-            t.type,
-            t.date,
-            t.quantity,
-            t.price,
-            t.currency,
-            t.fx_rate,
-            t.fees || 0,
-            t.total_gbp
-          );
-          results.imported++;
-        } catch (e: any) {
-          results.errors.push(`Error on ${t.ticker_symbol} (${t.date}): ${e.message}`);
         }
-      }
-    });
+      });
 
-    transaction(transactions);
-    res.json(results);
+      transaction(transactions);
+      res.json(results);
+    } catch (e: any) {
+      console.error("Batch Transaction Critical Failure:", e);
+      res.status(500).json({ error: e.message });
+    }
   });
 
   app.post("/api/market-data", async (req, res) => {
@@ -257,16 +300,77 @@ async function startServer() {
 
     try {
       const quotes = await Promise.all(
-        symbols.map(s => (yahooFinance.quote(s) as Promise<any>).catch(() => null))
+        symbols.map(s => (yf.quote(s) as Promise<any>).catch((err: any) => {
+          console.error(`Quote error for ${s}:`, err.message);
+          return null;
+        }))
       );
+
       const marketPrices: Record<string, number> = {};
+      
+      // We'll collect unique non-GBP currencies to fetch FX rates
+      const currenciesNeeded = new Set<string>();
+      quotes.forEach(q => {
+        if (q?.currency && q.currency !== "GBP") {
+          currenciesNeeded.add(q.currency);
+        }
+      });
+
+      // Simple real-time FX fetch for this request
+      const fxRates: Record<string, number> = { "GBP": 1 };
+      await Promise.all(
+        Array.from(currenciesNeeded).map(async (ccy) => {
+          if (ccy === "GBp" || ccy === "GBX") {
+            fxRates[ccy] = 0.01;
+          } else {
+            // Fetch current FX rate to GBP
+            try {
+              const pair = `${ccy}GBP=X`;
+              const fxQuote = await yf.quote(pair);
+              if (fxQuote?.regularMarketPrice) {
+                fxRates[ccy] = fxQuote.regularMarketPrice;
+              } else {
+                // Try inverse if needed, but CCYGBP=X is standard
+                fxRates[ccy] = 0; 
+              }
+            } catch (e) {
+              console.error(`FX fetch error for ${ccy}:`, e);
+              fxRates[ccy] = 0;
+            }
+          }
+        })
+      );
+
       quotes.forEach((q, i) => {
-        if (q) marketPrices[symbols[i]] = q.regularMarketPrice || 0;
+        const symbol = symbols[i];
+        if (q && q.regularMarketPrice !== undefined) {
+          const price = q.regularMarketPrice;
+          const currency = q.currency || "GBP";
+          const rate = fxRates[currency] ?? (currency === "GBp" || currency === "GBX" ? 0.01 : 1);
+          marketPrices[symbol] = price * rate;
+        } else {
+          marketPrices[symbol] = 0;
+        }
       });
       res.json(marketPrices);
-    } catch (e) {
+    } catch (e: any) {
       console.error("Market data fetch failed", e);
-      res.status(500).json({ error: "Failed to fetch market data" });
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/accounts/:id", (req, res) => {
+    const { id } = req.params;
+    try {
+      // Check if any transactions rely on this account
+      const usage = db.prepare("SELECT COUNT(*) as count FROM transactions WHERE account_id = ?").get(id) as any;
+      if (usage.count > 0) {
+        return res.status(400).json({ error: "Cannot delete account with existing transactions. Delete or reassign them first." });
+      }
+      db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
     }
   });
 
@@ -280,6 +384,16 @@ async function startServer() {
     db.prepare("UPDATE tickers SET manual_price = ?, last_updated = CURRENT_TIMESTAMP WHERE symbol = ?")
       .run(price, symbol);
     res.json({ success: true });
+  });
+
+  // Global Error Handler for API routes
+  app.use("/api", (err: any, req: any, res: any, next: any) => {
+    console.error("API Error:", err);
+    res.status(500).json({ error: err.message || "Internal Server Error" });
+  });
+
+  app.all("/api/*", (req, res) => {
+    res.status(404).json({ error: `Not Found: ${req.method} ${req.url}` });
   });
 
   // Vite setup
@@ -297,7 +411,7 @@ async function startServer() {
 
   const PORT = 3000;
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Portfolio Server V2 running on http://localhost:${PORT}`);
   });
 }
 

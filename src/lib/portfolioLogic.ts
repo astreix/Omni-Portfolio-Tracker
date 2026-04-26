@@ -2,13 +2,15 @@ import { Transaction, Holding, DividendRecorded, DividendSchedule, Ticker, Accou
 import { differenceInDays, addMonths, isAfter, isBefore } from 'date-fns';
 
 export function calculateHoldings(
-  transactions: Transaction[], 
-  dividends: DividendRecorded[], 
-  tickers: Ticker[],
-  marketPrices: Record<string, number>,
-  accounts: Account[],
+  transactions: Transaction[] = [], 
+  dividends: DividendRecorded[] = [], 
+  tickers: Ticker[] = [],
+  marketPrices: Record<string, number> = {},
+  accounts: Account[] = [],
   filterAccountId: number | 'Consolidated' = 'Consolidated'
 ): Holding[] {
+  if (!Array.isArray(transactions) || !Array.isArray(dividends)) return [];
+
   const holdings: Record<string, { buys: Transaction[], sells: Transaction[] }> = {};
 
   // Filter by account if needed
@@ -99,7 +101,7 @@ export function calculateHoldings(
 
 export function calculateIncomeForecast(
   holdings: Holding[],
-  schedules: DividendSchedule[],
+  schedules: DividendSchedule[] = [],
   months: number = 12
 ) {
   const now = new Date();
@@ -113,27 +115,28 @@ export function calculateIncomeForecast(
     forecast.push({ month: monthKey, amount: 0, details: [] });
   }
 
-  schedules.forEach(sec => {
-    const payDate = new Date(sec.pay_date);
-    if (isAfter(payDate, now) && isBefore(payDate, end)) {
-      const holding = holdings.find(h => h.symbol === sec.ticker);
-      if (holding && holding.quantity > 0) {
-        const netAmount = (sec.amount_per_share * holding.quantity) * (1 - sec.wht_rate);
-        
-        const monthIndex = differenceInDays(payDate, now) / 30; // Approximation
-        const actualIndex = (payDate.getMonth() - now.getMonth() + 12 * (payDate.getFullYear() - now.getFullYear()));
-        
-        if (actualIndex >= 0 && actualIndex < months) {
-          forecast[actualIndex].amount += netAmount;
-          forecast[actualIndex].details.push({
-            ticker: sec.ticker,
-            payDate: sec.pay_date,
-            amount: netAmount
-          });
+  if (Array.isArray(schedules)) {
+    schedules.forEach(sec => {
+      const payDate = new Date(sec.pay_date);
+      if (isAfter(payDate, now) && isBefore(payDate, end)) {
+        const holding = holdings.find(h => h.symbol === sec.ticker);
+        if (holding && holding.quantity > 0) {
+          const netAmount = (sec.amount_per_share * holding.quantity) * (1 - sec.wht_rate);
+          
+          const actualIndex = (payDate.getMonth() - now.getMonth() + 12 * (payDate.getFullYear() - now.getFullYear()));
+          
+          if (actualIndex >= 0 && actualIndex < months) {
+            forecast[actualIndex].amount += netAmount;
+            forecast[actualIndex].details.push({
+              ticker: sec.ticker,
+              payDate: sec.pay_date,
+              amount: netAmount
+            });
+          }
         }
       }
-    }
-  });
+    });
+  }
 
   return forecast;
 }

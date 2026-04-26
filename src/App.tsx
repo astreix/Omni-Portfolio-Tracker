@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { LayoutGrid, PieChart, ArrowUpRight, ArrowDownLeft, Import, Settings, Briefcase, Filter, LogOut, LogIn, TrendingUp, Calendar, Plus, Save, Search } from 'lucide-react';
+import { LayoutGrid, PieChart, ArrowUpRight, ArrowDownLeft, Import, Settings, Briefcase, Filter, LogOut, LogIn, TrendingUp, Calendar, Plus, Save, Search, Trash2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Ticker, Transaction, DividendRecorded, DividendSchedule, Holding, Account } from './types';
 import { calculateHoldings, calculateIncomeForecast } from './lib/portfolioLogic';
@@ -41,6 +41,7 @@ export default function App() {
   const [importStatus, setImportStatus] = useState('');
   const [csvInput, setCsvInput] = useState('');
   const [stagedTransactions, setStagedTransactions] = useState<any[]>([]);
+  const [importAccountId, setImportAccountId] = useState<number | ''>('');
   const [tickerQuery, setTickerQuery] = useState('');
   const [tickerResults, setTickerResults] = useState<any[]>([]);
 
@@ -50,15 +51,31 @@ export default function App() {
 
   const fetchInitialData = async () => {
     setLoading(true);
+    const safeFetch = async (url: string, options?: RequestInit) => {
+      const res = await fetch(url, options);
+      const contentType = res.headers.get('content-type');
+      if (contentType && contentType.includes('application/json')) {
+        return res.json();
+      }
+      const text = await res.text();
+      throw new Error(`Expected JSON but got ${contentType || 'unknown'}. Body: ${text.slice(0, 100)}`);
+    };
+
     try {
       const [txs, divs, schedules, accounts] = await Promise.all([
-        fetch('/api/transactions').then(r => r.json()),
-        fetch('/api/dividends-recorded').then(r => r.json()),
-        fetch('/api/dividend-schedule').then(r => r.json()),
-        fetch('/api/accounts').then(r => r.json())
+        safeFetch('/api/transactions'),
+        safeFetch('/api/dividends-recorded'),
+        safeFetch('/api/dividend-schedule'),
+        safeFetch('/api/accounts')
       ]);
       
-      setData(prev => ({ ...prev, transactions: txs, dividends: divs, schedules: schedules, accounts }));
+      setData(prev => ({ 
+        ...prev, 
+        transactions: Array.isArray(txs) ? txs : [], 
+        dividends: Array.isArray(divs) ? divs : [], 
+        schedules: Array.isArray(schedules) ? schedules : [], 
+        accounts: Array.isArray(accounts) ? accounts : [] 
+      }));
       
       if (txs.length > 0) {
         const symbols = [...new Set(txs.map((t: any) => t.ticker_symbol))];
@@ -67,8 +84,10 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ symbols })
         });
-        const marketPrices = await res.json();
-        setData(prev => ({ ...prev, marketPrices }));
+        if (res.ok) {
+          const marketPrices = await res.json();
+          setData(prev => ({ ...prev, marketPrices }));
+        }
       }
     } catch (e) {
       console.error(e);
@@ -107,85 +126,157 @@ export default function App() {
     setForms(f => ({ ...f, accountName: '' }));
   };
 
-  const processCsvContent = (content: string) => {
-    if (selectedAccountId === 'Consolidated') {
-      alert('Please select a specific account in the sidebar before importing.');
-      return;
-    }
-    
+  const handleDeleteAccount = async (id: number) => {
+    if (!window.confirm("Are you sure you want to delete this account? It must have no transactions.")) return;
     try {
-      const result = parse(content, { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true });
+      const res = await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        setData(prev => ({ ...prev, accounts: prev.accounts.filter(a => a.id !== id) }));
+        if (selectedAccountId === id) setSelectedAccountId('Consolidated');
+      } else {
+        const err = await res.json();
+        alert(err.error || "Failed to delete account");
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const parseFlexibleDate = (dateStr: string): string => {
+    if (!dateStr) return '';
+    const trimmed = dateStr.trim();
+    
+    // ISO format YYYY-MM-DD
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+    
+    // DD-Mon-YY (e.g. 21-Jan-22 or 21-Jan-2022)
+    const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+    if (trimmed.includes('-')) {
+      const parts = trimmed.split('-');
+      if (parts.length === 3) {
+        const d = parts[0].padStart(2, '0');
+        const mIdx = monthNames.indexOf(parts[1].toLowerCase());
+        if (mIdx !== -1) {
+          const m = (mIdx + 1).toString().padStart(2, '0');
+          let y = parts[2];
+          if (y.length === 2) y = `20${y}`;
+          return `${y}-${m}-${d}`;
+        }
+      }
+    }
+
+    // DD/MM/YYYY
+    if (trimmed.includes('/')) {
+      const parts = trimmed.split('/');
+      if (parts.length === 3) {
+        let d = parts[0].padStart(2, '0');
+        let m = parts[1].padStart(2, '0');
+        let y = parts[2];
+        if (y.length === 2) y = `20${y}`;
+        // Verify if it looks like DD/MM/YYYY or MM/DD/YYYY? Standard usually DD/MM/YYYY in UK/Refinitiv
+        return `${y}-${m}-${d}`;
+      }
+    }
+
+    return '';
+  };
+
+  const processCsvContent = (content: string) => {
+    try {
+      const result = parse(content, { 
+        columns: true, 
+        skip_empty_lines: true, 
+        trim: true, 
+        relax_column_count: true,
+        skip_records_with_error: true
+      });
       
+      const aliases = {
+        ticker: ['Ticker', 'Symbol', 'Asset'],
+        quantity: ['Quantity', 'Qty', 'Units/PAR', 'Units'],
+        price: ['Purchase Price', 'Price', 'Trade Amount'],
+        currency: ['Purchase currency', 'Currency', 'Local Currency'],
+        date: ['Date', 'Trade Date'],
+        fx: ['FX Rate', 'Exchange Rate'],
+        fees: ['Fees', 'Commission', 'Trade Fees']
+      };
+
+      const getVal = (item: any, keys: string[]) => {
+        for (const k of keys) {
+          if (item[k] !== undefined) return item[k];
+        }
+        return '';
+      };
+
       const mapped = result.map((item: any, index: number) => {
         const errors: string[] = [];
-        let ticker = (item['Ticker'] || '').split(',')[0].trim();
         
-        // Smart Ticker Correction (Yahoo formats)
+        const rawTicker = getVal(item, aliases.ticker);
+        let ticker = (rawTicker || '').toString().split(',')[0].trim();
+        
+        // Smart Ticker Correction
         if (ticker.includes(':')) {
           const parts = ticker.split(':');
           const exchange = parts[0].trim();
           const sym = parts[1].trim();
           if (exchange === 'LON') ticker = `${sym}.L`;
           else if (exchange === 'HKG') ticker = `${sym.padStart(4, '0')}.HK`;
-          else if (exchange === 'TSE') ticker = `${sym}.TO`;
+          else if (exchange === 'TSE' || exchange === 'TSX') ticker = `${sym}.TO`;
         }
 
-        let qty = parseFloat(item['Quantity'] || '0');
-        const rawPrice = parseFloat(item['Purchase Price'] || item['Price'] || '0');
-        const fxRate = parseFloat(item['FX Rate'] || '1');
-        const rawCurrency = item['Purchase currency'] || item['Currency'] || 'GBP';
+        const rawQty = getVal(item, aliases.quantity);
+        let qty = parseFloat(rawQty || '0');
+        
+        const rawPriceLine = getVal(item, aliases.price);
+        const rawPrice = parseFloat(rawPriceLine || '0');
+        
+        const rawFx = getVal(item, aliases.fx) || '1';
+        const fxRate = parseFloat(rawFx);
+
+        const rawFees = getVal(item, aliases.fees) || '0';
+        const fees = parseFloat(rawFees);
+        
+        const rawCurrency = getVal(item, aliases.currency) || 'GBP';
         const currency = rawCurrency.trim();
         
-        if (isNaN(qty)) errors.push(`Invalid Quantity: ${item['Quantity']}`);
-        if (isNaN(rawPrice)) errors.push(`Invalid Price: ${item['Purchase Price'] || item['Price']}`);
-
-        // Parse Date (21-Jan-22 or 2022-01-21)
-        let dateStr = item['Date'] || '';
-        if (dateStr.includes('-')) {
-          const parts = dateStr.split('-');
-          if (parts.length === 3) {
-            const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-            const monthIdx = monthNames.findIndex(m => m.toLowerCase() === parts[1].toLowerCase());
-            if (monthIdx !== -1) {
-              const year = parts[2].length === 2 ? `20${parts[2]}` : parts[2];
-              dateStr = `${year}-${(monthIdx + 1).toString().padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-            }
-          }
-        }
+        const rawDate = getVal(item, aliases.date);
+        const dateStr = parseFlexibleDate(rawDate);
         
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-          errors.push(`Invalid Date: ${item['Date']}. Use DD-Mon-YY.`);
-        }
+        if (!ticker) errors.push('Missing Ticker');
+        if (isNaN(qty) || qty === 0) errors.push('Invalid Quantity');
+        if (isNaN(rawPrice) || rawPrice === 0) errors.push('Invalid Price');
+        if (!dateStr) errors.push('Invalid Date Format');
 
+        // Derived Logic
         let priceGbp = rawPrice;
-        if (currency === 'GBP') {
+        if (currency.toUpperCase() === 'GBP') {
           priceGbp = rawPrice;
-        } else if (currency === 'GBp') {
+        } else if (currency.toUpperCase() === 'GBp' || currency === 'GBp') {
           priceGbp = rawPrice / 100;
         } else {
-          priceGbp = rawPrice / fxRate;
+          priceGbp = rawPrice / (fxRate || 1);
         }
 
-        const totalGbp = Math.abs(qty) * priceGbp;
-
         return {
-          id: `staging-${index}`,
+          id: `staging-${index}-${Date.now()}`,
           ticker_symbol: ticker,
           type: qty < 0 ? 'Sell' : 'Buy',
-          date: dateStr,
-          quantity: Math.abs(qty),
-          price: rawPrice,
+          date: dateStr || '',
+          rawDate: rawDate,
+          quantity: Math.abs(isNaN(qty) ? 0 : qty),
+          price: isNaN(rawPrice) ? 0 : rawPrice,
           currency: currency,
-          fx_rate: fxRate,
-          total_gbp: totalGbp,
+          fx_rate: isNaN(fxRate) ? 1 : fxRate,
+          fees: isNaN(fees) ? 0 : fees,
+          total_gbp: (Math.abs(isNaN(qty) ? 0 : qty) * priceGbp) + (isNaN(fees) ? 0 : fees),
           errors: errors
         };
       });
 
       setStagedTransactions(mapped);
-      setImportStatus(mapped.some(m => m.errors.length > 0) ? 'Action Required: Fix errors below' : 'Review Staged Data');
+      setImportStatus(mapped.some(m => m.errors.length > 0) ? 'Errors found in CSV' : 'CSV parsed successfully');
     } catch (e: any) {
-      alert(`Critical Parsing Error: ${e.message}\nMake sure your CSV has the correct headers.`);
+      setImportStatus(`Parse Error: ${e.message}`);
     }
   };
 
@@ -201,13 +292,29 @@ export default function App() {
   };
 
   const commitStaged = async () => {
+    if (importAccountId === '') {
+      setImportStatus('Please select a Target Account first.');
+      return;
+    }
+
     const valid = stagedTransactions.filter(t => t.errors.length === 0);
-    if (valid.length === 0) return;
+    if (valid.length === 0) {
+      setImportStatus('No valid records to commit.');
+      return;
+    }
 
     setImportStatus('Committing changes...');
     const mappedToApi = valid.map(t => ({
-      ...t,
-      account_id: selectedAccountId
+      ticker_symbol: t.ticker_symbol,
+      account_id: importAccountId,
+      type: t.type,
+      date: t.date,
+      quantity: t.quantity,
+      price: t.price,
+      currency: t.currency,
+      fx_rate: t.fx_rate,
+      fees: t.fees,
+      total_gbp: t.total_gbp
     }));
 
     try {
@@ -223,17 +330,35 @@ export default function App() {
         throw new Error(summary.error || 'Server rejected the batch.');
       }
 
-      if (summary.errors && summary.errors.length > 0) {
-        alert(`Commit partially failed:\n${summary.errors.slice(0, 3).join('\n')}`);
-      }
-
-      setImportStatus(`Imported ${summary.imported} records. ${summary.skipped} duplicates skipped.`);
+      setImportStatus(`Successfully imported ${summary.imported} records.`);
       setStagedTransactions([]);
       fetchInitialData();
     } catch (e: any) {
-      console.error(e);
       setImportStatus(`Commit Failed: ${e.message}`);
-      alert(`Error committing records: ${e.message}`);
+    }
+  };
+
+  const handleAddManualDividend = async () => {
+    if (!forms.divTicker || !forms.divAmount) return;
+    try {
+      const res = await fetch('/api/dividend-schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ticker: forms.divTicker,
+          ex_date: forms.divExDate,
+          pay_date: forms.divPayDate,
+          amount_per_share: parseFloat(forms.divAmount),
+          currency: 'GBP',
+          wht_rate: parseFloat(forms.divWht) || 0
+        })
+      });
+      if (res.ok) {
+        fetchInitialData();
+        setForms(f => ({ ...f, divTicker: '', divExDate: '', divPayDate: '', divAmount: '', divWht: '0' }));
+      }
+    } catch (e) {
+      console.error(e);
     }
   };
 
@@ -274,13 +399,20 @@ export default function App() {
                 Consolidated
               </button>
               {data.accounts.map(acc => (
-                <button
-                  key={acc.id}
-                  onClick={() => setSelectedAccountId(acc.id)}
-                  className={`w-full text-left px-3 py-2 rounded text-xs font-bold transition-all ${selectedAccountId === acc.id ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-slate-300'}`}
-                >
-                  {acc.name}
-                </button>
+                <div key={acc.id} className="group relative">
+                  <button
+                    onClick={() => setSelectedAccountId(acc.id)}
+                    className={`w-full text-left px-3 py-2 rounded text-xs font-bold transition-all pr-8 ${selectedAccountId === acc.id ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+                  >
+                    {acc.name}
+                  </button>
+                  <button 
+                    onClick={(e) => { e.stopPropagation(); handleDeleteAccount(acc.id); }}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-700 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-all p-1"
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
               ))}
             </div>
             
@@ -352,7 +484,7 @@ export default function App() {
                                <span className="text-indigo-400">{((h.currentValueGbp / totalValuation) * 100).toFixed(1)}%</span>
                             </div>
                             <div className="h-1 bg-slate-800 rounded-full overflow-hidden">
-                               <div className="h-full bg-indigo-500" style={{ width: `${(h.currentValueGbp / totalValuation) * 100}%` }}></div>
+                               <div className="h-full bg-indigo-500" style={{ width: `${totalValuation > 0 ? (h.currentValueGbp / totalValuation) * 100 : 0}%` }}></div>
                             </div>
                          </div>
                        ))}
@@ -410,7 +542,10 @@ export default function App() {
                         <FormInput label="Div/Share" type="number" value={forms.divAmount} onChange={v => setForms(f => ({ ...f, divAmount: v }))} />
                         <FormInput label="WHT Rate" type="number" value={forms.divWht} onChange={v => setForms(f => ({ ...f, divWht: v }))} />
                      </div>
-                     <button className="w-full bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-black py-2.5 rounded uppercase tracking-widest mt-4 flex items-center justify-center gap-2">
+                     <button 
+                        onClick={handleAddManualDividend}
+                        className="w-full bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-black py-2.5 rounded uppercase tracking-widest mt-4 flex items-center justify-center gap-2"
+                      >
                         <Save size={14} /> Commit Record
                      </button>
                   </div>
@@ -445,90 +580,111 @@ export default function App() {
           {activeTab === 'import' && (
             <motion.div key="imp" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="max-w-6xl space-y-8 pb-20">
                <div className="bg-slate-900/50 p-8 rounded-xl border border-slate-800/50">
-                  <h2 className="text-xl font-black mb-4 uppercase italic">Portfolio Maintenance</h2>
-                  <p className="text-xs text-slate-500 font-bold mb-8 uppercase leading-relaxed">
-                    Import transactions to <span className="text-indigo-400">{selectedAccountId === 'Consolidated' ? 'Selected Account' : data.accounts.find(a => a.id === selectedAccountId)?.name}</span>.
+                  <h2 className="text-xl font-black mb-2 uppercase italic">Data Maintenance Hub</h2>
+                  <p className="text-[10px] text-slate-500 font-bold mb-8 uppercase tracking-widest leading-relaxed">
+                    Overhaul your portfolio with batch imports. Multi-header compatibility enabled.
                   </p>
-                  
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    <div className="space-y-4">
-                      <div className="border-2 border-dashed border-slate-800 rounded-xl p-8 text-center hover:border-indigo-500 transition-all cursor-pointer relative group">
-                        <input 
-                          type="file" 
-                          accept=".csv"
-                          onChange={handleFileUpload}
-                          className="absolute inset-0 opacity-0 cursor-pointer"
-                        />
-                        <Import size={32} className="mx-auto text-slate-700 mb-4 group-hover:text-indigo-500 transition-colors" />
-                        <p className="text-xs font-black text-slate-500 uppercase tracking-widest">Drop CSV or Click to Upload</p>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
+                    
+                    <div className="lg:col-span-2 space-y-6">
+                      <div className="bg-slate-900 border border-slate-800 p-6 rounded-xl">
+                        <label className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4 block">1. Select Target Account</label>
+                        {data.accounts.length === 0 ? (
+                          <div className="bg-rose-500/10 border border-rose-500/20 p-4 rounded text-xs font-bold text-rose-400">
+                            No accounts found. Please create an account in the sidebar first.
+                          </div>
+                        ) : (
+                          <select 
+                            value={importAccountId}
+                            onChange={(e) => setImportAccountId(e.target.value ? Number(e.target.value) : '')}
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-4 py-3 text-xs font-black text-indigo-400 outline-none focus:ring-1 focus:ring-indigo-500 transition-all appearance-none cursor-pointer"
+                          >
+                            <option value="">-- Choose Account --</option>
+                            {data.accounts.map(acc => (
+                              <option key={acc.id} value={acc.id}>{acc.name}</option>
+                            ))}
+                          </select>
+                        )}
                       </div>
-                      
-                      <div className="relative">
-                        <textarea 
-                          className="w-full h-40 bg-slate-950 border border-slate-800 rounded-lg p-6 font-mono text-[11px] text-indigo-400 outline-none focus:ring-1 focus:ring-indigo-500"
-                          placeholder="Or paste Ticker,Date,Quantity,Price... records here"
-                          value={csvInput}
-                          onChange={e => setCsvInput(e.target.value)}
-                        />
-                        <button 
-                          onClick={() => processCsvContent(csvInput)}
-                          className="absolute bottom-4 right-4 bg-slate-800 hover:bg-slate-700 px-4 py-2 rounded text-[10px] font-black uppercase tracking-widest"
-                        >
-                          Parse Input
-                        </button>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="border-2 border-dashed border-slate-800 rounded-xl p-8 text-center hover:border-indigo-500 transition-all cursor-pointer relative group bg-slate-950/20">
+                          <input 
+                            type="file" 
+                            accept=".csv"
+                            onChange={handleFileUpload}
+                            className="absolute inset-0 opacity-0 cursor-pointer"
+                          />
+                          <Import size={24} className="mx-auto text-slate-700 mb-2 group-hover:text-indigo-500 transition-colors" />
+                          <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Upload CSV</p>
+                        </div>
+                        
+                        <div className="relative">
+                          <textarea 
+                            className="w-full h-28 bg-slate-950 border border-slate-800 rounded-lg p-4 font-mono text-[11px] text-indigo-300 outline-none focus:ring-1 focus:ring-indigo-500"
+                            placeholder="Paste CSV rows here..."
+                            value={csvInput}
+                            onChange={e => setCsvInput(e.target.value)}
+                          />
+                          <button 
+                            onClick={() => processCsvContent(csvInput)}
+                            className="absolute bottom-3 right-3 bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded text-[9px] font-black uppercase tracking-widest text-slate-100 transition-colors"
+                          >
+                            Map Data
+                          </button>
+                        </div>
                       </div>
                     </div>
 
-                    <div className="bg-slate-900/50 p-6 rounded-xl border border-slate-800/50">
-                       <h3 className="text-sm font-black uppercase tracking-widest mb-4 italic">Ticker Reference</h3>
-                       <div className="relative mb-4">
+                    <div className="bg-slate-900/50 p-6 rounded-xl border border-slate-800/50 h-full">
+                       <h3 className="text-[10px] font-black text-slate-600 uppercase tracking-widest mb-4">Live Symbol Lookup</h3>
+                       <div className="relative mb-6">
                           <input 
                             type="text" 
-                            placeholder="Search Yahoo symbols..."
-                            className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2 text-xs font-bold text-indigo-400 outline-none focus:ring-1 focus:ring-indigo-500"
+                            placeholder="Search Yahoo..."
+                            className="w-full bg-slate-950 border border-slate-800 rounded px-3 py-2.5 text-xs font-bold text-indigo-400 outline-none focus:ring-1 focus:ring-indigo-500 shadow-inner"
                             value={tickerQuery}
                             onChange={e => setTickerQuery(e.target.value)}
                           />
                        </div>
                        
-                       <div className="space-y-2 max-h-40 overflow-y-auto custom-scrollbar my-4">
+                       <div className="space-y-1.5 max-h-60 overflow-y-auto custom-scrollbar">
                           {tickerResults.map((r, idx) => (
                             <div 
                               key={idx} 
-                              className="text-[10px] bg-slate-800/50 p-2 rounded flex justify-between items-center cursor-pointer hover:bg-indigo-500/20"
+                              className="text-[10px] bg-slate-950/50 border border-slate-800 p-2.5 rounded flex justify-between items-center cursor-pointer hover:bg-indigo-500/10 transition-colors group"
                               onClick={() => {
-                                // If they click a result, let's copy the symbol
                                 navigator.clipboard.writeText(r.symbol);
-                                alert(`Copied ${r.symbol} to clipboard`);
+                                setImportStatus(`Copied ${r.symbol}`);
                               }}
                             >
-                              <span className="font-bold text-indigo-400">{r.symbol}</span>
-                              <span className="text-slate-500 truncate ml-2">{r.shortname || r.longname}</span>
+                              <span className="font-black text-indigo-400">{r.symbol}</span>
+                              <span className="text-slate-600 group-hover:text-slate-400 truncate ml-2 transition-colors">{r.shortname || r.longname}</span>
                             </div>
                           ))}
+                          {tickerQuery.length >= 2 && tickerResults.length === 0 && (
+                            <p className="text-center py-4 text-[9px] font-bold text-slate-700 uppercase tracking-[0.2em]">Searching Alpha...</p>
+                          )}
                        </div>
-
-                       <p className="text-[10px] text-slate-600 font-bold leading-relaxed border-t border-slate-800 pt-4">
-                         US: RELX<br/>
-                         London: REL.L<br/>
-                         Brazil: PBR, PBR-A<br/>
-                         Canada: NEO.TO
-                       </p>
                     </div>
                   </div>
 
                   {stagedTransactions.length > 0 && (
                     <div className="mt-10 space-y-6">
-                      <div className="flex justify-between items-center">
-                        <h3 className="text-lg font-black uppercase italic text-white">Staged transactions ({stagedTransactions.length})</h3>
-                        <div className="flex gap-4 items-center">
-                          <span className="text-[10px] font-black uppercase tracking-widest text-indigo-400">{importStatus}</span>
+                      <div className="flex justify-between items-center bg-slate-900 p-4 rounded-xl border border-slate-800">
+                        <div>
+                          <h3 className="text-sm font-black uppercase tracking-widest text-white italic">Stage Area</h3>
+                          <p className="text-[10px] text-slate-500 font-bold uppercase mt-1">{stagedTransactions.length} items parsed</p>
+                        </div>
+                        <div className="flex gap-6 items-center">
+                          <span className={`text-[10px] font-black uppercase tracking-widest transition-all ${importStatus.includes('Error') ? 'text-rose-500' : 'text-indigo-400'}`}>{importStatus}</span>
                           <button 
                             onClick={commitStaged}
-                            disabled={stagedTransactions.some(t => t.errors.length > 0)}
-                            className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 text-white px-8 py-2 rounded font-black text-xs uppercase tracking-widest transition-all shadow-xl shadow-indigo-500/20"
+                            disabled={stagedTransactions.some(t => t.errors.length > 0) || importAccountId === ''}
+                            className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-20 text-white px-10 py-3 rounded font-black text-[11px] uppercase tracking-widest transition-all shadow-xl shadow-indigo-500/20 active:scale-95"
                           >
-                            Commit Valid Records
+                            Vault Commit
                           </button>
                         </div>
                       </div>
@@ -537,68 +693,104 @@ export default function App() {
                         <table className="w-full text-left">
                           <thead className="bg-slate-900 border-b border-slate-800">
                             <tr className="text-[9px] font-black text-slate-500 uppercase tracking-widest italic">
-                              <th className="px-4 py-4">Ticker</th>
-                              <th className="px-4 py-4">Date</th>
-                              <th className="px-4 py-4">Qty</th>
-                              <th className="px-4 py-4">Price</th>
-                              <th className="px-4 py-4">Status</th>
+                              <th className="px-6 py-5">Ticker</th>
+                              <th className="px-6 py-5">Date (YYYY-MM-DD)</th>
+                              <th className="px-6 py-5">Qty</th>
+                              <th className="px-6 py-5">Value/FX</th>
+                              <th className="px-6 py-5 text-right">Status</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-800/50">
-                              {stagedTransactions.map((st, i) => (
-                                <tr key={st.id} className="group">
-                                  <td className="px-4 py-3">
-                                    <div className="flex items-center gap-2">
+                              {stagedTransactions.map((st, i) => {
+                                const hasErrors = st.errors.length > 0;
+                                return (
+                                  <tr key={st.id} className={`group ${hasErrors ? 'bg-rose-500/5' : 'hover:bg-slate-900/30'} transition-all`}>
+                                    <td className="px-6 py-4">
+                                      <div className="flex items-center gap-2">
+                                        <input 
+                                          className={`bg-slate-900 border ${hasErrors && st.errors.includes('Missing Ticker') ? 'border-rose-500' : 'border-slate-800'} rounded text-[11px] font-black text-white px-2 py-1 outline-none focus:border-indigo-500 w-24`}
+                                          value={st.ticker_symbol}
+                                          onChange={e => {
+                                            const newTxs = [...stagedTransactions];
+                                            newTxs[i].ticker_symbol = e.target.value;
+                                            // Simple re-validation
+                                            newTxs[i].errors = newTxs[i].errors.filter((er: string) => er !== 'Missing Ticker');
+                                            if (!e.target.value) newTxs[i].errors.push('Missing Ticker');
+                                            setStagedTransactions(newTxs);
+                                          }}
+                                        />
+                                        <Search size={10} className="text-slate-700 group-hover:text-indigo-500 cursor-pointer transition-colors" onClick={() => setTickerQuery(st.ticker_symbol)} />
+                                      </div>
+                                    </td>
+                                    <td className="px-6 py-4">
                                       <input 
-                                        className="bg-transparent border-none text-[11px] font-black text-white outline-none focus:text-indigo-400 w-24"
-                                        value={st.ticker_symbol}
+                                        className={`bg-slate-900 border ${hasErrors && st.errors.includes('Invalid Date Format') ? 'border-rose-500' : 'border-slate-800'} rounded text-[11px] font-bold text-slate-400 px-2 py-1 outline-none focus:border-white w-32`}
+                                        value={st.date}
+                                        placeholder="YYYY-MM-DD"
                                         onChange={e => {
                                           const newTxs = [...stagedTransactions];
-                                          newTxs[i].ticker_symbol = e.target.value;
+                                          newTxs[i].date = e.target.value;
+                                          newTxs[i].errors = newTxs[i].errors.filter((er: string) => er !== 'Invalid Date Format');
+                                          if (!/^\d{4}-\d{2}-\d{2}$/.test(e.target.value)) newTxs[i].errors.push('Invalid Date Format');
                                           setStagedTransactions(newTxs);
                                         }}
                                       />
-                                      <button 
-                                        onClick={() => setTickerQuery(st.ticker_symbol)}
-                                        className="opacity-0 group-hover:opacity-100 text-slate-600 hover:text-indigo-400 transition-all"
-                                        title="Lookup in reference"
-                                      >
-                                        <Search size={12} />
-                                      </button>
-                                    </div>
-                                  </td>
-                                  <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{st.type}</td>
-                                  <td className="px-4 py-3">
-                                    <input 
-                                      type="date"
-                                      className="bg-transparent border-none text-[11px] font-bold text-slate-400 outline-none focus:text-white"
-                                      value={st.date}
-                                      onChange={e => {
-                                        const newTxs = [...stagedTransactions];
-                                        newTxs[i].date = e.target.value;
-                                        setStagedTransactions(newTxs);
-                                      }}
-                                    />
-                                  </td>
-                                  <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{st.quantity}</td>
-                                  <td className="px-4 py-3 text-[11px] font-mono text-slate-500">{(st.price).toFixed(2)} {st.currency}</td>
-                                  <td className="px-4 py-3 flex items-center justify-between">
-                                    {st.errors.length > 0 ? (
-                                      <span className="text-[10px] font-black text-rose-500 uppercase">{st.errors[0]}</span>
-                                    ) : (
-                                      <span className="text-[10px] font-black text-emerald-500 uppercase">VALID</span>
-                                    )}
-                                    <button 
-                                      onClick={() => {
-                                        setStagedTransactions(prev => prev.filter((_, idx) => idx !== i));
-                                      }}
-                                      className="opacity-0 group-hover:opacity-100 text-slate-600 hover:text-rose-500 transition-all px-2"
-                                    >
-                                      ×
-                                    </button>
-                                  </td>
-                                </tr>
-                              ))}
+                                    </td>
+                                    <td className="px-6 py-4">
+                                      <input 
+                                        type="number"
+                                        className={`bg-slate-900 border ${hasErrors && st.errors.includes('Invalid Quantity') ? 'border-rose-500' : 'border-slate-800'} rounded text-[11px] font-mono text-slate-400 px-2 py-1 outline-none focus:border-indigo-500 w-24`}
+                                        value={st.quantity}
+                                        onChange={e => {
+                                          const v = parseFloat(e.target.value);
+                                          const newTxs = [...stagedTransactions];
+                                          newTxs[i].quantity = isNaN(v) ? 0 : v;
+                                          newTxs[i].errors = newTxs[i].errors.filter((er: string) => er !== 'Invalid Quantity');
+                                          if (isNaN(v) || v === 0) newTxs[i].errors.push('Invalid Quantity');
+                                          setStagedTransactions(newTxs);
+                                        }}
+                                      />
+                                    </td>
+                                    <td className="px-6 py-4">
+                                      <div className="flex flex-col gap-1">
+                                        <input 
+                                          type="number"
+                                          className={`bg-slate-900 border ${hasErrors && st.errors.includes('Invalid Price') ? 'border-rose-500' : 'border-slate-800'} rounded text-[10px] font-mono text-slate-500 px-2 py-1 outline-none focus:border-indigo-500 w-24`}
+                                          value={st.price}
+                                          onChange={e => {
+                                            const v = parseFloat(e.target.value);
+                                            const newTxs = [...stagedTransactions];
+                                            newTxs[i].price = isNaN(v) ? 0 : v;
+                                            newTxs[i].errors = newTxs[i].errors.filter((er: string) => er !== 'Invalid Price');
+                                            if (isNaN(v) || v === 0) newTxs[i].errors.push('Invalid Price');
+                                            setStagedTransactions(newTxs);
+                                          }}
+                                        />
+                                        <span className="text-[9px] text-slate-600 font-bold uppercase tracking-widest pl-1">{st.currency} (FX: {st.fx_rate})</span>
+                                      </div>
+                                    </td>
+                                    <td className="px-6 py-4 text-right">
+                                      <div className="flex items-center justify-end gap-3">
+                                        {hasErrors ? (
+                                          <div className="flex flex-col items-end">
+                                            {st.errors.map((er: string, idx: number) => (
+                                              <span key={idx} className="text-[9px] font-black text-rose-500 uppercase tracking-tighter">{er}</span>
+                                            ))}
+                                          </div>
+                                        ) : (
+                                          <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">READY</span>
+                                        )}
+                                        <button 
+                                          onClick={() => setStagedTransactions(prev => prev.filter((_, idx) => idx !== i))}
+                                          className="text-slate-700 hover:text-rose-500 transition-colors p-1"
+                                        >
+                                          ×
+                                        </button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
                           </tbody>
                         </table>
                       </div>
